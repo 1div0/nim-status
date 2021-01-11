@@ -1,5 +1,5 @@
 import # std libs
-  json, options
+  json, options, strutils
 
 import # vendor libs
   json_serialization, json_serialization/std/options as json_options, sqlcipher,
@@ -30,3 +30,10 @@ proc fromDbValue*(val: DbValue, T: typedesc[Address]): Address = val.strVal.pars
 
 proc fromDbValue*[T: seq[auto]](val: DbValue, _: typedesc[T]): T =
   Json.decode(val.strVal, T, allowUnknownFields = true)
+
+# Strips leading zeroes and appends 0x prefix
+proc intToHex*(n: int): string = 
+  var s = n.toHex
+  s.removePrefix({'0'})
+  result = "0x" & s
+
