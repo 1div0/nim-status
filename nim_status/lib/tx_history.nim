@@ -1,6 +1,6 @@
 import callrpc, conversions
 
-import web3, json, strutils, strformat
+import web3, json, strutils, strformat, sequtils
 import json_rpc/client
 import nimcrypto
 import tables
@@ -15,14 +15,17 @@ const erc20TransferType = "erc20"
 
 type 
   BlockRange = array[2, int]
+  BlockSeq = seq[int]
   Address = string
+  TransferType* = enum
+    eth, erc20
   TransferView* = ref object 
     # we need to assign our own id because txHash is too ambitious fro ERC20 transfers 
     #ID          common.Hash    `json:"id"`
     id*: string
     # type "eth" or "erc20"
     #Type        TransferType   `json:"type"`
-    transferType*: string
+    transferType*: TransferType
     # not completely sure what this one means 
     #Address     common.Address `json:"address"`
     address*: Address
@@ -37,7 +40,7 @@ type
     timestamp*: int
     # retrieved via `eth_getTransactionByHash`
     #GasPrice    *hexutil.Big   `json:"gasPrice"`
-    gasPrice*:int
+    gasPrice*: int
     # retrieved via `eth_getTransactionByHash`
     #GasLimit    hexutil.int64 `json:"gasLimit"`
     gasLimit*: int64
@@ -49,13 +52,13 @@ type
     nonce*: int64
     # retrieved via `eth_getTransactionReceipt`
     #TxStatus    hexutil.int64 `json:"txStatus"`
-    txStatus*: int64
+    txStatus*: int
     # retrieved via `eth_getTransactionByHash`
     #Input       hexutil.Bytes  `json:"input"`
-    input*: seq[byte]
+    input*: string
     # retrieved via `eth_getBlockByNumber` or `eth_getLogs`
     #TxHash      common.Hash    `json:"txHash"`
-    txHash*:string
+    txHash*: string
     # retrieved via `eth_getTransactionByHash` or `eth_getLogs`
     #Value       *hexutil.Big   `json:"value"`
     value*: int
@@ -118,11 +121,6 @@ proc txBinarySearch*(address: Address): BlockRange =
   let lastBlockNumber = fromHex[int](resp.result.getStr)
 
 
-  # Find upper bound (number of the block containing last tx)
-  # This means finding the lowest blockNumber containing totalTxCount txs
-  # let rightBlock = findLowestBlockNumber(address, @[0, lastBlockNumber], 
-  #                         getTxCountForBlock, totalTxCount)
-
   var leftBlock = 0
   if totalTxCount > 20:
     # Find lower bound (number of the block containing lowerTxBound txs
@@ -137,12 +135,10 @@ proc txBinarySearch*(address: Address): BlockRange =
   return [leftBlock, lastBlockNumber]
 
 
-
-
 # First, we find a lowest block number with balance
 # equal to that of toBlock
 # Then we check if there were any outgoing txs between it and the last block,
-# as it could've been that several txs balanced themselves out
+# as it could've happened that several txs balanced themselves out
 proc findBlockWithBalanceChange(address: Address, blockRange: BlockRange): int =
   var fromBlock = blockRange[0]
   var toBlock = blockRange[1]
@@ -151,19 +147,31 @@ proc findBlockWithBalanceChange(address: Address, blockRange: BlockRange): int =
   blockNumber = findLowestBlockNumber(address, [fromBlock, toBlock], 
                          RemoteMethod.eth_getBalance, targetBalance)
 
-  # Check if there were no txs in [blockNumber, rightBlock]
+  # Check if there were no txs in [blockNumber, toBlock]
+  # Note that eth_getTransactionCount only counts outgoing transactions
   let txCount1 = getValueForBlock(address, intToHex(blockNumber), RemoteMethod.eth_getTransactionCount)
-  let txCount2 = getValueForBlock(address, intToHex(blockRange[1]), RemoteMethod.eth_getTransactionCount)
+  let txCount2 = getValueForBlock(address, intToHex(toBlock), RemoteMethod.eth_getTransactionCount)
   if txCount1 == txCount2:
+    # No txs occurred in between [blockNumber, toBlock]
     result = blockNumber
   else:
-    result = findLowestBlockNumber(address, [fromBlock, toBlock], 
+    # At least several txs occurred, so we find the number
+    # of the lowest block containing txCount2
+    blockNumber = findLowestBlockNumber(address, [fromBlock, toBlock], 
                         RemoteMethod.eth_getTransactionCount, txCount2)
+    let balance = getValueForBlock(address, intToHex(blockNumber), RemoteMethod.eth_getBalance)
+    if balance == targetBalance:
+      # This was the tx setting targetbalance
+      result = blockNumber
+    else:
+      # This means there must have been an incoming tx inside [blockNumber, toBlock]
+      result = findLowestBlockNumber(address, [blockNumber, toBlock], 
+                         RemoteMethod.eth_getBalance, targetBalance)
 
 
 # We need to find exact block numbers containing balance changes
-proc balanceBinarySearch(address: Address, blockRange: BlockRange): seq[int] =
-  var blockNumbers: seq[int] = @[]
+proc balanceBinarySearch(address: Address, blockRange: BlockRange): BlockSeq =
+  var blockNumbers: BlockSeq = @[]
   var fromBlock = blockRange[0]
   var toBlock = blockRange[1]
   while fromBlock < toBlock and len(blockNumbers) < 20:
@@ -174,12 +182,39 @@ proc balanceBinarySearch(address: Address, blockRange: BlockRange): seq[int] =
 
   result = blockNumbers
 
-let transferEventSignatureHash = $keccak_256.digest("Transfer(address,address,int256)")
 var txToData = initTable[string, TransferView]()
 
+# Find blocks with balance changes and extract tx hashes from info
+# fetched via eth_getBlockByNumber
+proc findEthTxHashes(address: Address, txBlockRange: BlockRange, txToData: var TransferMap) =
+  # Find block numbers containing balance changes
+  var blockNumbers: BlockSeq = balanceBinarySearch(address, txBlockRange)
+
+  # Get block info and extract txs pertaining to given address
+  for n in items(blockNumbers):
+    let blockNumber = intToHex(n)
+    let jsonNode = parseJSON(fmt"""["{blockNumber}", true]""")
+    let resp = callRPC(web3Obj, RemoteMethod.eth_getBlockByNumber, jsonNode)
+
+    let blockHash = resp.result["hash"].getStr
+    let timestamp = fromHex[int](resp.result["timestamp"].getStr)
+    for tx in items(resp.result["transactions"]):
+      if tx["from"].getStr == address or tx["to"].getStr == address:
+        let txHash = tx["hash"].getStr
+        let trView = TransferView(
+          transferType: TransferType.eth,
+          address: address,
+          blockNumber: n, 
+          blockHash: blockHash,
+          timestamp: timestamp,
+          txHash: txHash)
+        txToData[txHash] = trView
+
+
+let transferEventSignatureHash = $keccak_256.digest("Transfer(address,address,int256)")
 # We have to invoke eth_getLogs twice for both
 # incoming and outgoing ERC-20 transfers
-proc erc20Logs(address: Address, blockRange: BlockRange, txToData: var TransferMap) =
+proc fetchErc20Logs(address: Address, blockRange: BlockRange, txToData: var TransferMap) =
   let fromBlock = blockRange[0]
   let toBlock = blockRange[1]
   var jsonNode = parseJson(fmt"""[{{  
@@ -194,42 +229,19 @@ proc erc20Logs(address: Address, blockRange: BlockRange, txToData: var TransferM
 
   var outgoingLogs = callRPC(web3Obj, RemoteMethod.eth_getLogs, jsonNode)
 
-  var txHashes: seq[string] = @[]
-  for obj in incomingLogs.result:
+  var logs: seq[JsonNode] = concat(incomingLogs.result.getElems, outgoingLogs.result.getElems)
+  for obj in logs:
     let txHash = obj["transactionHash"].getStr
     let blockNumber = fromHex[int](obj["blockNumber"].getStr)
     let blockHash = obj["blockHash"].getStr
     let trView = TransferView(
-      txHash: txHash, 
+      transferType: TransferType.erc20,
+      address: address,
       blockNumber: blockNumber,
-      transferType: erc20TransferType,
-      blockHash: blockHash)
+      blockHash: blockHash,
+      txHash: txHash 
+      )
     txToData[txHash] = trView
-
-  for obj in outgoingLogs.result:
-    let txHash = obj["transactionHash"].getStr
-    let blockNumber = fromHex[int](obj["blockNumber"].getStr)
-    let blockHash = obj["blockHash"].getStr
-    let trView = TransferView(
-      txHash: txHash, 
-      blockNumber: blockNumber,
-      transferType: erc20TransferType,
-      blockHash: blockHash)
-    txToData[txHash] = trView
-
-
-proc findEthTxHashes(address: Address, txBlockRange: BlockRange, txToData: var TransferMap) =
-  # Find block numbers containing balance changes
-  var blockNumbers: seq[int] = balanceBinarySearch(address, txBlockRange)
-
-  for n in items(blockNumbers):
-    let blockNumber = intToHex(n)
-    let jsonNode = parseJSON(fmt"""[{blockNumber}, false]""")
-    let resp = callRPC(web3Obj, RemoteMethod.eth_getBlockByNumber, jsonNode)
-    for tx in items(resp.result["transactions"]):
-      let txHash = tx.getStr
-      let trView = TransferView(blockNumber: n, txHash: txHash)
-      txToData[txHash] = trView
 
   
 proc fetchTxDetails(address: Address, txToData: TransferMap) =
@@ -238,20 +250,28 @@ proc fetchTxDetails(address: Address, txToData: TransferMap) =
     let txInfo = callRPC(web3Obj, RemoteMethod.eth_getTransactionByHash, jsonNode)
     let txReceipt = callRPC(web3Obj, RemoteMethod.eth_getTransactionReceipt, jsonNode)
 
-    # let transferView = TransferView(
-    #   transferType: "eth",
-    #   address: address,
-    #   blockNumber
+    let trView = txToData[tx]
+    trView.gasPrice = fromHex[int](txInfo.result["gasPrice"].getStr)
+    trView.gasLimit = fromHex[int](txInfo.result["gas"].getStr)
+    trView.gasUsed = fromHex[int](txReceipt.result["gasUsed"].getStr)
+    trView.nonce = fromHex[int](txInfo.result["nonce"].getStr)
+    trView.txStatus = fromHex[int](txReceipt.result["status"].getStr)
+    trView.input = txInfo.result["input"].getStr
+    trView.value = fromHex[int](txInfo.result["value"].getStr)
+    trView.fromAddr = txInfo.result["from"].getStr
+    trView.toAddr = txInfo.result["to"].getStr
 
-    # )
-
-proc fetchTxHistory(address: Address): TransferMap = 
+proc fetchTxHistory*(address: Address): TransferMap = 
   var txToData = TransferMap()
 
   # Find block range that we will search for balance changes
   let txBlockRange: BlockRange = txBinarySearch(address)
+  if txBlockRange == [0, 0]:
+    # No txs found
+    return txToData
+
   findEthTxHashes(address, txBlockRange, txToData)
-  erc20Logs(address, txBlockRange, txToData)
+  fetchErc20Logs(address, txBlockRange, txToData)
 
   fetchTxDetails(address, txToData)
 
