@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS transfers (
+  id VARCHAR NOT NULL,
+  tx_type VARCHAR NOT NULL,
+  address VARCHAR NOT NULL,
+  block_number INT NOT NULL,
+  block_hash INT NOT NULL,
+  timestamp INT NOT NULL,
+  gas_price INT,
+  gas_limit INT,
+  gas_used INT,
+  nonce INT,
+  tx_status INT,
+  input VARCHAR,
+  tx_hash VARCHAR,
+  value INT,
+  from_addr string,
+  to_addr string,
+  contract string,
+  network_id int
+) WITHOUT ROWID

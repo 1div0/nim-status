@@ -1,9 +1,14 @@
-import callrpc, conversions
+import callrpc, conversions, os
 
 import web3, json, strutils, strformat, sequtils
 import json_rpc/client
 import nimcrypto
 import tables
+import # vendor libs
+  web3/conversions as web3_conversions, web3/ethtypes,
+  sqlcipher, json_serialization, json_serialization/[reader, writer, lexer],
+  stew/byteutils
+
 
 #import # nim-status libs
   #../[settings, database, conversions, tx_history, callrpc]
@@ -17,66 +22,163 @@ type
   BlockRange = array[2, int]
   BlockSeq = seq[int]
   Address = string
-  TransferType* = enum
+  TxType* = enum
     eth, erc20
-  TransferView* = ref object 
+
+  TransferMap* = Table[string, Transfer]
+
+  TxDbData = ref object
+    blockNumber: int
+    balance: int
+    txCount: int
+    txToData : TransferMap
+
+  TransferType* {.pure.} = enum
+    Id = "id",
+    TxType = "txType",
+    Address = "address",
+    BlockNumber = "blockNumber",
+    BlockHash = "blockHash",
+    Timestamp = "timestamp",
+    GasPrice = "gasPrice",
+    GasLimit = "gasLimit",
+    GasUsed = "gasUsed",
+    Nonce = "nonce",
+    TxStatus = "txStatus",
+    Input = "input",
+    TxHash = "txHash",
+    Value = "value",
+    FromAddr = "fromAddr",
+    ToAddr = "toAddr",
+    Contract = "contract",
+    NetworkID = "networkID"
+
+
+  TransferCol* {.pure.} = enum
+    Id = "id",
+    TxType = "tx_type",
+    Address = "address",
+    BlockNumber = "block_number",
+    BlockHash = "block_hash",
+    Timestamp = "timestamp",
+    GasPrice = "gas_price",
+    GasLimit = "gas_limit",
+    GasUsed = "gas_used",
+    Nonce = "nonce",
+    TxStatus = "tx_status",
+    Input = "input",
+    TxHash = "tx_hash",
+    Value = "value",
+    FromAddr = "from_addr",
+    ToAddr = "to_addr",
+    Contract = "contract",
+    NetworkID = "network_id"
+
+  Transfer* = ref object 
     # we need to assign our own id because txHash is too ambitious fro ERC20 transfers 
     #ID          common.Hash    `json:"id"`
-    id*: string
+    id* {.serializedFieldName($TransferType.Id), dbColumnName($TransferCol.Id).}: string
     # type "eth" or "erc20"
     #Type        TransferType   `json:"type"`
-    transferType*: TransferType
+    txType* {.serializedFieldName($TransferType.TxType), dbColumnName($TransferCol.TxType)}: TxType
     # not completely sure what this one means 
     #Address     common.Address `json:"address"`
-    address*: Address
+    address* {.serializedFieldName($TransferType.Address), dbColumnName($TransferCol.Address)}: Address
     # is known after range scan
     # BlockNumber *hexutil.Big   `json:"blockNumber"`
-    blockNumber*: int
+    blockNumber* {.serializedFieldName($TransferType.BlockNumber), dbColumnName($TransferCol.BlockNumber)}: int
     # retrieved via `eth_getBlockByNumber`
     # BlockHash   common.Hash    `json:"blockhash"`
-    blockHash*: string
+    blockHash* {.serializedFieldName($TransferType.BlockHash), dbColumnName($TransferCol.BlockHash)}: string
     # retrieved via `eth_getBlockByNumber`
     #Timestamp   hexutil.int64 `json:"timestamp"`
-    timestamp*: int
+    timestamp* {.serializedFieldName($TransferType.Timestamp), dbColumnName($TransferCol.Timestamp)}: int
     # retrieved via `eth_getTransactionByHash`
     #GasPrice    *hexutil.Big   `json:"gasPrice"`
-    gasPrice*: int
+    gasPrice* {.serializedFieldName($TransferType.GasPrice), dbColumnName($TransferCol.GasPrice)}: int
     # retrieved via `eth_getTransactionByHash`
     #GasLimit    hexutil.int64 `json:"gasLimit"`
-    gasLimit*: int64
+    gasLimit* {.serializedFieldName($TransferType.GasLimit), dbColumnName($TransferCol.GasLimit)}: int64
     # retrieved via `eth_getTransactionReceipt`
     #GasUsed     hexutil.int64 `json:"gasUsed"`
-    gasUsed*: int64
+    gasUsed* {.serializedFieldName($TransferType.GasUsed), dbColumnName($TransferCol.GasUsed)}: int64
     # retrieved via `eth_getTransactionByHash`
     #Nonce       hexutil.int64 `json:"nonce"`
-    nonce*: int64
+    nonce* {.serializedFieldName($TransferType.Nonce), dbColumnName($TransferCol.Nonce)}: int64
     # retrieved via `eth_getTransactionReceipt`
     #TxStatus    hexutil.int64 `json:"txStatus"`
-    txStatus*: int
+    txStatus* {.serializedFieldName($TransferType.TxStatus), dbColumnName($TransferCol.TxStatus)}: int
     # retrieved via `eth_getTransactionByHash`
     #Input       hexutil.Bytes  `json:"input"`
-    input*: string
+    input* {.serializedFieldName($TransferType.Input), dbColumnName($TransferCol.Input)}: string
     # retrieved via `eth_getBlockByNumber` or `eth_getLogs`
     #TxHash      common.Hash    `json:"txHash"`
-    txHash*: string
+    txHash* {.serializedFieldName($TransferType.TxHash), dbColumnName($TransferCol.TxHash)}: string
     # retrieved via `eth_getTransactionByHash` or `eth_getLogs`
     #Value       *hexutil.Big   `json:"value"`
-    value*: int
+    value* {.serializedFieldName($TransferType.Value), dbColumnName($TransferCol.Value)}: int
     # retrieved via `eth_getTransactionByHash` or `eth_getLogs`
     #From        common.Address `json:"from"`
-    fromAddr*: Address
+    fromAddr* {.serializedFieldName($TransferType.FromAddr), dbColumnName($TransferCol.FromAddr)}: Address
     # retrieved via `eth_getTransactionByHash` or `eth_getLogs`
     #To          common.Address `json:"to"`
-    toAddr*: Address
+    toAddr* {.serializedFieldName($TransferType.ToAddr), dbColumnName($TransferCol.ToAddr)}: Address
     # retrieved via `eth_getTransactionReceipt` or `eth_getLogs`
     #Contract    common.Address `json:"contract"`
-    contract*: Address
+    contract* {.serializedFieldName($TransferType.Contract), dbColumnName($TransferCol.Contract)}: Address
     #NetworkID   int64
-    networkID*:   int64
+    networkID* {.serializedFieldName($TransferType.NetworkID), dbColumnName($TransferCol.NetworkID)}:   int64
 
-  TransferMap* = Table[string, TransferView]
+# proc getChats*(db: DbConn): seq[Chat] = 
+#   let query = """SELECT * from chats"""
 
-var web3Obj: Web3
+#   result = db.all(Chat, query)
+
+# proc getChatById*(db: DbConn, id: string): Option[Chat] = 
+#   let query = """SELECT * from chats where id = ?"""
+  
+#   result = db.one(Chat, query, id)
+
+# proc saveChat*(db: DbConn, chat: Chat) = 
+#   let query = fmt"""INSERT INTO chats(
+#     {$ChatCol.Id},
+#     {$ChatCol.Name},
+#     {$ChatCol.Color},
+#     {$ChatCol.ChatType},
+#     {$ChatCol.Active},
+#     {$ChatCol.Timestamp},
+#     {$ChatCol.DeletedAtClockValue},
+#     {$ChatCol.PublicKey},
+#     {$ChatCol.UnviewedMessageCount},
+#     {$ChatCol.LastClockValue},
+#     {$ChatCol.LastMessage},
+#     {$ChatCol.Members},
+#     {$ChatCol.MembershipUpdates},
+#     {$ChatCol.Profile},
+#     {$ChatCol.InvitationAdmin},
+#     {$ChatCol.Muted})
+#     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) 
+#   """
+#   db.exec(query, 
+#     chat.id,
+#     chat.name,
+#     chat.color,
+#     chat.chatType,
+#     chat.active,
+#     chat.timestamp,
+#     chat.deletedAtClockValue,
+#     chat.publicKey,
+#     chat.unviewedMessageCount,
+#     chat.lastClockValue,
+#     chat.lastMessage,
+#     chat.members,
+#     chat.membershipUpdates,
+#     chat.profile,
+#     chat.invitationAdmin,
+#     chat.muted)
+
+
+var web3Obj {.threadvar.}: Web3
 
 proc setWeb3Obj*(web3: Web3) = 
   web3Obj = web3
@@ -89,6 +191,11 @@ proc getValueForBlock(address: Address, blockNumber: string, methodName: RemoteM
   let txCount = fromHex[int](resp.result.getStr)
 
   return txCount
+
+proc getLastBlockNumber(): int =
+  var jsonNode = parseJSON("""[]""")
+  var resp = callRPC(web3Obj, RemoteMethod.eth_blockNumber, jsonNode)
+  return fromHex[int](resp.result.getStr)
 
 # Find lowest block number for which a condition
 # procPtr(address, blockNumber) >= targetValue holds
@@ -116,10 +223,7 @@ proc txBinarySearch*(address: Address): BlockRange =
     return [0, 0]
 
   # Get last block number
-  var jsonNode = parseJSON("""[]""")
-  var resp = callRPC(web3Obj, RemoteMethod.eth_blockNumber, jsonNode)
-  let lastBlockNumber = fromHex[int](resp.result.getStr)
-
+  let lastBlockNumber = getLastBlockNumber()
 
   var leftBlock = 0
   if totalTxCount > 20:
@@ -182,11 +286,11 @@ proc balanceBinarySearch(address: Address, blockRange: BlockRange): BlockSeq =
 
   result = blockNumbers
 
-var txToData = initTable[string, TransferView]()
+var txToData = initTable[string, Transfer]()
 
 # Find blocks with balance changes and extract tx hashes from info
 # fetched via eth_getBlockByNumber
-proc findEthTxHashes(address: Address, txBlockRange: BlockRange, txToData: var TransferMap) =
+proc fetchEthTxHashes(address: Address, txBlockRange: BlockRange, txToData: var TransferMap) =
   # Find block numbers containing balance changes
   var blockNumbers: BlockSeq = balanceBinarySearch(address, txBlockRange)
 
@@ -201,8 +305,8 @@ proc findEthTxHashes(address: Address, txBlockRange: BlockRange, txToData: var T
     for tx in items(resp.result["transactions"]):
       if tx["from"].getStr == address or tx["to"].getStr == address:
         let txHash = tx["hash"].getStr
-        let trView = TransferView(
-          transferType: TransferType.eth,
+        let trView = Transfer(
+          txType: TxType.eth,
           address: address,
           blockNumber: n, 
           blockHash: blockHash,
@@ -211,16 +315,20 @@ proc findEthTxHashes(address: Address, txBlockRange: BlockRange, txToData: var T
         txToData[txHash] = trView
 
 
-let transferEventSignatureHash = $keccak_256.digest("Transfer(address,address,int256)")
 # We have to invoke eth_getLogs twice for both
 # incoming and outgoing ERC-20 transfers
-proc fetchErc20Logs(address: Address, blockRange: BlockRange, txToData: var TransferMap) =
+proc fetchErc20Logs(address: Address, blockRange: BlockRange, txToData: var TransferMap) {.gcsafe.} =
+  let transferEventSignatureHash = $keccak_256.digest("Transfer(address,address,int256)")
+
   let fromBlock = blockRange[0]
   let toBlock = blockRange[1]
   var jsonNode = parseJson(fmt"""[{{  
     "fromBlock": "{fromBlock}", 
     "toBlock": "{toBlock}",
     "topics": ["{transferEventSignatureHash}", "", "{address}"]}}]""")
+
+  var web3Obj: Web3
+
   var incomingLogs = callRPC(web3Obj, RemoteMethod.eth_getLogs, jsonNode)
   jsonNode = parseJson(fmt"""[{{  
     "fromBlock": "{fromBlock}", 
@@ -234,8 +342,8 @@ proc fetchErc20Logs(address: Address, blockRange: BlockRange, txToData: var Tran
     let txHash = obj["transactionHash"].getStr
     let blockNumber = fromHex[int](obj["blockNumber"].getStr)
     let blockHash = obj["blockHash"].getStr
-    let trView = TransferView(
-      transferType: TransferType.erc20,
+    let trView = Transfer(
+      txType: TxType.erc20,
       address: address,
       blockNumber: blockNumber,
       blockHash: blockHash,
@@ -270,9 +378,49 @@ proc fetchTxHistory*(address: Address): TransferMap =
     # No txs found
     return txToData
 
-  findEthTxHashes(address, txBlockRange, txToData)
+  fetchEthTxHashes(address, txBlockRange, txToData)
   fetchErc20Logs(address, txBlockRange, txToData)
 
   fetchTxDetails(address, txToData)
 
   result = txToData
+
+proc fetchDbData(): TxDbData = 
+  return TxDbData()
+
+proc writeToDb(txToData: TransferMap) = 
+  echo "writeToDb"
+
+let schedulerInterval = 2 * 60 * 1000
+
+proc schedulerProc() {.thread.} =
+  var dbData = fetchDbData()
+  let lastDbBlockNumber = dbData.blockNumber
+  let dbTxCount = dbData.txCount
+  let dbBalance = dbData.balance
+  let address = "0x0"
+  while true:
+    var lastBlockNumber = getLastBlockNumber()
+    if lastBlockNumber > lastDbBlockNumber:
+      let txCount = getValueForBlock(address, intToHex(lastBlockNumber), RemoteMethod.eth_getTransactionCount)
+      let balance = getValueForBlock(address, intToHex(lastBlockNumber), RemoteMethod.eth_getBalance)
+
+
+      let txBlockRange: BlockRange = [lastDbBlockNumber + 1, lastBlockNumber]
+      var txToData = TransferMap()
+      if dbTxCount != txCount or dbBalance != balance:
+        fetchEthTxHashes(address, txBlockRange, txToData)
+
+      fetchErc20Logs(address, txBlockRange, txToData)
+
+      if len(txToData) > 0:
+        fetchTxDetails(address, txToData)
+      writeToDb(txToData)
+
+    sleep(schedulerInterval)
+
+proc init*(address: Address) =
+  # let 
+  #
+  var schedulerThread: Thread[void]
+  createThread(schedulerThread, schedulerProc)
